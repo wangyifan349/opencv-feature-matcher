@@ -6,6 +6,8 @@ This guide explains the app's workflow, feature methods, matching pipeline, and 
 
 The app is a compact, local desktop tool for learning and experimenting with classical OpenCV feature matching. It lets you compare ORB, SIFT, and AKAZE on your own image pairs and inspect how descriptor filtering and geometric verification affect localization.
 
+Thank you for trying the application and sharing your feedback. Your time, suggestions, and support are greatly appreciated.
+
 ## 🖥️ The Matching tab
 
 The Matching tab contains the image loaders, algorithm selector, method-specific parameters, shared matching controls, previews, and result image.

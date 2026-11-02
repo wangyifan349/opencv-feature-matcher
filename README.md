@@ -47,6 +47,8 @@ There is no universally best method. Try ORB first; compare SIFT or AKAZE if the
 
 This project is a hands-on desktop tool for exploring classical feature matching. It makes the main stages visible—from local keypoints and descriptor matches to RANSAC verification and the projected reference boundary. It is intended for experimentation and planar-object localization, not as a general-purpose semantic object detector.
 
+Thank you for taking the time to try the project, share feedback, and help improve it. Your interest and support are sincerely appreciated.
+
 ## 🎛️ Parameters
 
 The **Algorithm Parameters** panel changes with the selected method:

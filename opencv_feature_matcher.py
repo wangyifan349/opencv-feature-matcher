@@ -212,6 +212,8 @@ class ORBMatcherApp:
             "3. Find the two nearest scene descriptors for each reference descriptor (KNN), then apply the Lowe ratio test.\n"
             "4. Estimate a perspective homography with RANSAC. Geometrically consistent matches are inliers.\n"
             "5. Draw inlier connections. If there are enough inliers, project the reference image boundary and draw it in yellow.\n\n"
+            "ABOUT THIS APPLICATION\n"
+            "This is a compact, local tool for exploring classical feature matching. It is designed for experimentation and planar-object localization, not general semantic object recognition.\n\n"
             "FEATURE ALGORITHMS\n"
             "ORB — Fast, free-to-use binary descriptors. A good default for general matching. Uses Hamming distance. "
             "Scale Factor controls the image pyramid step; Pyramid Levels controls how many scales are searched; "

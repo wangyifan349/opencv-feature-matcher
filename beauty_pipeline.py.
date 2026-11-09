@@ -1,0 +1,361 @@
+# ==============================================================================
+# Script Name: beauty_pipeline.py
+# Purpose: An advanced, precise digital face-beauty and portrait editing framework.
+#
+# Core Logic:
+# 1. LANDMARK DETECTION & SKIN MASKING (MediaPipe Face Mesh):
+#    Extracts coordinates of key facial structures. Constructs a blurred skin
+#    mask while manually carving out eyes and lips to preserve raw sharpness.
+# 2. SECTOR-SPECIFIC FACE SLIMMING (Multi-point Guided Warp):
+#    Uses 6 localized coordinates along the jawline. Warps vertices inward
+#    obliquely towards anchoring facial centers (corners of mouth/chin base).
+#    Keeps the warp radius narrow to isolate deformations from background/features.
+# 3. GUIDED FILTER SMOOTHING (Edge-preserving Blurring):
+#    Performs non-destructive spatial blending to erase blemishes and skin noise
+#    while retaining natural structural boundaries.
+# 4. LOGARITHMIC WHITENING (Non-linear Brightness Compression):
+#    Applies a logarithmic transformation to the V (Value) channel in HSV space.
+#    Accentuates midtones and shadows while safeguarding highlights from clipping.
+# 5. LAB CHROMATIC REDDENING (A-channel Mapping):
+#    Modulates values on the a-axis (green-red spectrum) within the Lab color space
+#    to infuse realistic facial vitality and natural ruddiness.
+# 6. MASK WARP LOG TRACKING & PIXEL BLENDING:
+#    Re-warps the skin mask using the exact jawline transform logs, then mixes
+#    the original and stylized plates together via alpha-channel matting.
+#
+# Dependencies:
+#    pip install opencv-python opencv-contrib-python numpy mediapipe
+# ==============================================================================
+
+import cv2
+import numpy as np
+import mediapipe as mp
+
+
+def local_translate_warp(img, start_pt, end_pt, radius):
+    """
+    Applies an interactive local image warping algorithm (Gustafsson's method).
+    Deforms pixels smoothly within a localized circular radius without tearing.
+    """
+    h, w, c = img.shape
+
+    # 1. Initialize grid coordinate maps
+    map_x, map_y = np.meshgrid(np.arange(w), np.arange(h))
+    map_x = map_x.astype(np.float32)
+    map_y = map_y.astype(np.float32)
+
+    # 2. Compute the Euclidean distance field relative to the warp center
+    dx = map_x - start_pt[0]
+    dy = map_y - start_pt[1]
+    distance = np.sqrt(dx**2 + dy**2)
+
+    # 3. Isolate the target region within the deformation threshold
+    mask = distance < radius
+
+    # 4. Define the vector offsets for translation
+    v_x = end_pt[0] - start_pt[0]
+    v_y = end_pt[1] - start_pt[1]
+
+    # 5. Execute smooth falloff calculation (Quadratic curve attenuation)
+    ratio = (radius - distance) / radius
+    ratio = np.where(mask, ratio, 0)
+    factor = ratio**2
+
+    # 6. Apply inverse mapping calculations to prevent pixel gaps
+    map_x = map_x - factor * v_x
+    map_y = map_y - factor * v_y
+
+    # 7. Reconstruct the image topology via bilinear interpolation
+    warped_img = cv2.remap(
+        img,
+        map_x,
+        map_y,
+        cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REFLECT_101
+    )
+    return warped_img
+
+
+def get_face_features_and_mask(img):
+    """
+    Extracts structural geometry, builds a skin mask, and retrieves precise jawline points.
+    """
+    h, w, _ = img.shape
+    mask = np.zeros((h, w), dtype=np.uint8)
+    features = {}
+
+    mp_face_mesh = mp.solutions.face_mesh
+    with mp_face_mesh.FaceMesh(
+        static_image_mode=True,
+        max_num_faces=1,
+        refine_landmarks=True,
+        min_detection_confidence=0.5
+    ) as face_mesh:
+
+        # MediaPipe backend requires native RGB ordering
+        rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        results = face_mesh.process(rgb_img)
+
+        # Fallback mechanism: Return a global mask if no face geometry is localized
+        if not results.multi_face_landmarks:
+            return np.ones((h, w), dtype=np.uint8) * 255, None
+
+        landmarks = results.multi_face_landmarks.landmark
+
+        # 1. Build initial outer facial perimeter boundary mask
+        face_oval_idx = [
+            10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288,
+            397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136,
+            172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109
+        ]
+        face_points = np.array([
+            [int(landmarks[i].x * w), int(landmarks[i].y * h)]
+            for i in face_oval_idx
+        ])
+        cv2.fillPoly(mask, [face_points], 255)
+
+        # 2. Carve out structural voids for internal features (eyes and lips)
+        features_void_idx = [
+            # Left eye path
+            [
+                33, 7, 163, 144, 145, 153, 154, 155,
+                133, 173, 157, 158, 159, 160, 161, 246
+            ],
+
+            # Right eye path
+            [
+                362, 382, 381, 380, 374, 373, 390, 249,
+                263, 466, 388, 387, 386, 385, 384, 398
+            ],
+
+            # Lips path
+            [
+                61, 146, 91, 181, 84, 17, 314, 405, 321, 375,
+                291, 308, 324, 318, 402, 317, 14, 87, 178, 88, 95
+            ]
+        ]
+
+        for idx_list in features_void_idx:
+            pts = np.array([
+                [int(landmarks[i].x * w), int(landmarks[i].y * h)]
+                for i in idx_list
+            ])
+            cv2.fillPoly(mask, [pts], 0)
+
+        # Helper: Localized conversion of normalized coordinates to pixel spaces
+        def get_pt(idx):
+            return [
+                int(landmarks[idx].x * w),
+                int(landmarks[idx].y * h)
+            ]
+
+        # 3. Retrieve precise jawline feature control points (Mandibular borders)
+        features["left_jaw_pts"] = [
+            get_pt(132), get_pt(172), get_pt(136)
+        ]  # Ear lobe down to mid-jaw
+        features["right_jaw_pts"] = [
+            get_pt(361), get_pt(397), get_pt(365)
+        ]  # Right symmetrical nodes
+
+        # 4. Map corresponding oblique internal pull vectors (Mouth corners & chin center)
+        features["left_targets"] = [
+            get_pt(57), get_pt(164), get_pt(152)
+        ]
+        features["right_targets"] = [
+            get_pt(287), get_pt(164), get_pt(152)
+        ]
+
+        # 5. Metric baseline to anchor adaptive scaling radii
+        features["face_width"] = np.sqrt(
+            (get_pt(132)[0] - get_pt(361)[0])**2
+            + (get_pt(132)[1] - get_pt(361)[1])**2
+        )
+
+    # Feather edge profiles to remove sharp boundary transitions
+    blurred_mask = cv2.GaussianBlur(mask, (15, 15), 0)
+    return blurred_mask, features
+
+
+def advanced_beauty_with_slimming(
+    img,
+    blur_radius=15,
+    eps=0.02,
+    blur_alpha=0.7,
+    whiten_beta=0.4,
+    ruddy=6,
+    slim_strength=0.04
+):
+    """
+    Main beauty pipeline execution interface.
+    Pipeline: Multi-point Warp -> Guided Smoothing -> Log Whitening -> Lab Tinting -> Compositing.
+    """
+    h, w, _ = img.shape
+
+    # 0. Execute initial landscape scanning & facial mesh lookup
+    skin_mask, features = get_face_features_and_mask(img)
+
+    if features is None:
+        print("[Warning] Face structure not detected. Skipping processing pipeline.")
+        return img
+
+    # ================== STEP 1: CONTOURED FACIAL SLIMMING ==================
+    img_slimmed = img.copy()
+    mask_slimmed = skin_mask.copy()
+
+    # Constrain the warp radius to 25% of face width to safeguard backgrounds from drifting
+    warp_radius = int(features["face_width"] * 0.25)
+    move_dist = features["face_width"] * slim_strength
+
+    # Transaction log tracking array for downstream mask transforms
+    warp_history = []
+
+    # Execute geometric vector modifications across left mandibular points
+    for start, target in zip(
+        features["left_jaw_pts"],
+        features["left_targets"]
+    ):
+        dx = target[0] - start[0]
+        dy = target[1] - start[1]
+        norm = np.sqrt(dx**2 + dy**2)
+
+        if norm > 0:
+            end = [
+                int(start[0] + (dx / norm) * move_dist),
+                int(start[1] + (dy / norm) * move_dist)
+            ]
+            img_slimmed = local_translate_warp(
+                img_slimmed, start, end, warp_radius
+            )
+            warp_history.append((start, end))
+
+    # Execute geometric vector modifications across right mandibular points
+    for start, target in zip(
+        features["right_jaw_pts"],
+        features["right_targets"]
+    ):
+        dx = target[0] - start[0]
+        dy = target[1] - start[1]
+        norm = np.sqrt(dx**2 + dy**2)
+
+        if norm > 0:
+            end = [
+                int(start[0] + (dx / norm) * move_dist),
+                int(start[1] + (dy / norm) * move_dist)
+            ]
+            img_slimmed = local_translate_warp(
+                img_slimmed, start, end, warp_radius
+            )
+            warp_history.append((start, end))
+
+    # ================== STEP 2: EDGE-PRESERVING SKIN SMOOTHING ==================
+    img_float = img_slimmed.astype(np.float32) / 255.0
+
+    try:
+        # Utilize OpenCV Extended Modules API for native guided filter computation
+        filtered = cv2.ximgproc.guidedFilter(
+            guide=img_slimmed,
+            src=img_slimmed,
+            radius=blur_radius,
+            eps=eps
+        )
+    except AttributeError:
+        # Resilient fallback path utilizing adaptive bilateral smoothing
+        filtered = cv2.bilateralFilter(
+            img_slimmed,
+            d=blur_radius,
+            sigmaColor=75,
+            sigmaSpace=75
+        )
+
+    filtered = filtered.astype(np.float32) / 255.0
+
+    # Linearly interpolate between raw details and filtered passes
+    skin_blur = cv2.addWeighted(
+        img_float,
+        1.0 - blur_alpha,
+        filtered,
+        blur_alpha,
+        0
+    )
+    skin_blur = np.clip(skin_blur * 255, 0, 255).astype(np.uint8)
+
+    # ================== STEP 3: LOGARITHMIC SKIN WHITENING ==================
+    hsv = cv2.cvtColor(skin_blur, cv2.COLOR_BGR2HSV).astype(np.float32)
+    v_normalized = hsv[:, :, 2] / 255.0
+
+    if whiten_beta > 0:
+        # Mathematical curve: V_out = ln(V_in * beta + 1) / ln(beta + 1)
+        c = 1.0 / np.log(1.0 + whiten_beta)
+        v_out = c * np.log(1.0 + whiten_beta * v_normalized)
+        hsv[:, :, 2] = np.clip(v_out, 0.0, 1.0) * 255.0
+
+    skin_white = cv2.cvtColor(
+        hsv.astype(np.uint8),
+        cv2.COLOR_HSV2BGR
+    )
+
+    # ================== STEP 4: CHROMATIC REDDENING (VITALITY BOOST) ==================
+    lab = cv2.cvtColor(skin_white, cv2.COLOR_BGR2Lab).astype(np.float32)
+
+    # Infuse saturation strictly onto the red-green color dimension channel (a-channel)
+    lab[:, :, 1] += ruddy
+    lab[:, :, 1] = np.clip(lab[:, :, 1], 0, 255)
+    full_beauty = cv2.cvtColor(
+        lab.astype(np.uint8),
+        cv2.COLOR_Lab2BGR
+    )
+
+    # ================== STEP 5: MASK SYNCHRONIZATION & PORTRATURE BLENDING ==================
+    # Mirror the historical jaw-deformation pass sequence on the alpha mask channel
+    for start, end in warp_history:
+        mask_slimmed = local_translate_warp(
+            mask_slimmed, start, end, warp_radius
+        )
+
+    # Scale dynamic ranges into normalized floating weight spaces
+    skin_mask_f = mask_slimmed.astype(np.float32) / 255.0
+    skin_mask_3d = cv2.merge([
+        skin_mask_f,
+        skin_mask_f,
+        skin_mask_f
+    ])
+
+    # Blend beauty map against warped baseline environment arrays
+    img_beauty_float = full_beauty.astype(np.float32)
+    result = (
+        img_beauty_float * skin_mask_3d
+        + img_slimmed.astype(np.float32) * (1.0 - skin_mask_3d)
+    )
+    return np.clip(result, 0, 255).astype(np.uint8)
+
+
+# ------------------ PIPELINE APPLICATION DEMO RUNNER ------------------
+
+if __name__ == "__main__":
+    # Load target testing source photograph from file workspace tree
+    input_img = cv2.imread("face.jpg")
+
+    if input_img is None:
+        print(
+            "[Error] Source asset file 'face.jpg' "
+            "not found in workspace context root path."
+        )
+    else:
+        # Tuning parameters initialization configurations block setup
+        output_img = advanced_beauty_with_slimming(
+            input_img,
+            blur_radius=15,    # Spatial context kernel coverage sizing
+            blur_alpha=0.7,    # Mixing balance factor threshold for skin textures
+            whiten_beta=0.4,   # Non-linear exposure gain value allocation mapping
+            ruddy=6,           # Dynamic saturation modification amplitude constant
+            slim_strength=0.04 # Displacement percentage relative to facial diameter
+        )
+
+        # Tile images side-by-side to review changes
+        compare = np.hstack((input_img, output_img))
+        cv2.imshow(
+            "Optimized Precise Slimming & Beauty Pipeline",
+            compare
+        )
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
